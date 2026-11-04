@@ -31,6 +31,10 @@
 #ifndef HAKIOS_X6826B
 #define HAKIOS_X6826B       0
 #endif
+/* 1 on a new phone: read and report (screen and ramoops), then Android; XNU is not started. */
+#ifndef BOARD_PROBE
+#define BOARD_PROBE         0
+#endif
 #include "mtkdbg.h"
 #include "board.h"
 
@@ -39,7 +43,22 @@
 #include "mtkspi.h"
 #include "tcm.h"
 #endif
+/*
+ * The identity XNU is told (made from the user's own IPSW, xnuloader/mkidentity.sh). The probe
+ * (BOARD_PROBE=1) does not start XNU and builds without it; a run without it is refused.
+ */
+#if __has_include("../xnuloader/identity.h")
 #include "../xnuloader/identity.h"
+#define HAVE_IDENTITY       1
+#else
+#define HAVE_IDENTITY       0
+#if !BOARD_PROBE
+#error "no xnuloader/identity.h: make it from your IPSW (xnuloader/mkidentity.sh), or build the probe (-DBOARD_PROBE=1)"
+#endif
+struct identity_prop { const char *name; unsigned int offset, length; };
+static const struct identity_prop identity_root[1], identity_product[1], identity_haptics[1];
+static const unsigned char identity_root_data[1], identity_product_data[1], identity_haptics_data[1];
+#endif
 
 /*
  * XNU's view of memory: one contiguous range that nothing else (LK, Android, TEE, ATF, the
@@ -2003,10 +2022,6 @@ static void watcher_start(void)
 
 /* ---- the board: what LK's tree says, and whether the ranges we write are free ---- */
 
-/* 1 on a new phone: read and report (screen and ramoops), then Android; XNU is not started. */
-#ifndef BOARD_PROBE
-#define BOARD_PROBE         0
-#endif
 
 static void say_range(const char *what, uint64_t base, uint64_t size)
 {
