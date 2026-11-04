@@ -25,3 +25,6 @@ mtkloader/*.img
 *.dylib
 __pycache__/
 .DS_Store
+# runs' logs, the phone's facts and backups of its partitions: the phone's, not the tree's
+logs/
+backup/

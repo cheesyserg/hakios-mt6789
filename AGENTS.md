@@ -5,12 +5,14 @@ and the rules that are not obvious from the code. Read it before changing anythi
 
 ## What this is
 
-HakiOS for the **Infinix Hot 20 (X6826B)**: MediaTek Helio G85 (MT6768), Mali-G52 MC2, eMMC, 6 GB of RAM (the kernel is given 4).
-Apple's open XNU kernel (xnu-8796.121.2) and iOS 16.5's unmodified user space, started by this
-phone's own loader. This is the device repository; the shared kernel, user space and Metal driver
+HakiOS for the **Infinix Hot 60 Pro (X6885)**: MediaTek Helio G200 (MT6789), Mali-G57 MC2, UFS 2.2, 8 GB of RAM (the kernel is
+given 4), a 1224×2720 AMOLED. Ported from the Hot 20 (X6826B, MT6768), whose repository this was: **the port has not run on the
+phone yet** (docs/x6885-port.md says what changed and the order to run it in). Apple's open XNU kernel (xnu-8796.121.2) and iOS
+16.5's unmodified user space, started by this phone's own loader. This is the device repository; the shared kernel, user space and Metal driver
 live in the organisation's common repositories (`hakios-xnu-kernel`, `hakios-metal`). Every other
-device in the organisation is Qualcomm: do not carry Qualcomm assumptions (UEFI, UFS, Adreno, SMMU,
-QMI) over to this phone.
+device in the organisation is Qualcomm: do not carry Qualcomm assumptions (UEFI, Adreno, SMMU, QMI) over to this phone; its
+UFS is MediaTek's host, used only as LK leaves it. Nor carry the Hot 20's over: the code that is only that phone's is behind
+`HAKIOS_X6826B=1` (loader) and `buttons=2` (kernel).
 
 ## Layout
 
@@ -18,8 +20,8 @@ QMI) over to this phone.
 | --- | --- | --- |
 | `mtkloader/` | bare-metal loader, runs with the MMU off before XNU | MIT |
 | `kernel/` | this phone's XNU drivers, as paths of the kernel tree (`kernel/README.md`) | APSL 2.0 |
-| `configs/` | `x6826b_defconfig`, `x6826b.config`: the kernel's configuration (its drivers: `hakios-xnu-kernel/mtk/mt6768/`) | MIT |
-| `tools/` | one run (`xnu-cycle.sh`), flashing, probes, log readers | MIT |
+| `configs/` | `x6885_defconfig`, `x6885.config`: the kernel's configuration (its SoC layer, `mtk/mt6789/`, is not in the common tree yet) | MIT |
+| `tools/` | the phone's facts (`x6885-facts.sh`), the first run (`x6885-probe.sh`), one run (`xnu-cycle.sh`), flashing, log readers | MIT |
 | `docs/` | how each part was found, run by run | MIT |
 | `pull-firmware.sh` | the phone's firmware out of the user's own phone into `fw-*/` | MIT |
 | `device.conf` | the phone and each component's state (`works` / `partial` / `missing`) | |
@@ -28,15 +30,17 @@ The common tree's branch `mtk` has the same loader and scripts as `mtk/loader/` 
 under `hakios` names as `mtk/mt6768/drivers/`; a change to one belongs in the other as well. Paths below are that tree's.
 
 How a boot goes: `mtkloader` is chained in front of Android's kernel in `boot_a`
-(`mtk/tools/chainboot.py`, `mtk/loader/build_flashed.py`). Android boots normally; `mtk/tools/boot-xnu.sh`
+(`mtk/tools/chainboot.py`, `mtk/loader/build_flashed.py`; boot image v4 on this phone, entered at 0x40000000, the loader moves
+itself to 0x40080000). It reads where DRAM, its reservations and ramoops are out of the device tree LK hands it
+(`mtkloader/board.h`) and refuses to run if XNU's window is not free. Android boots normally; `mtk/tools/boot-xnu.sh`
 asks it for one XNU boot; the loader brings up what XNU cannot (touch firmware over SPI, PMIC, clocks),
 builds XNU's device tree and boot-args, and starts the kernel. The kernel's root is the iOS system
-image in the `xnusys` partition, read off the eMMC as needed (`mtk/mt6768/drivers/storage/hakios.mtk_emmc.c`,
-`emmc_root=1`, with `rd=md0` kept for libignition). A run ends after `XNU_SECS`, the watchdog
+image in the `xnusys` partition, read off the UFS as needed (`kernel/bsd/dev/redwood_ufs.c`, `ufs_root=1`, with `rd=md0` kept
+for libignition; the Hot 20's was the eMMC, `hakios.mtk_emmc.c`, `emmc_root=1`). A run ends after `XNU_SECS`, the watchdog
 returns the phone to Android, and the log is read back from pstore (`/sys/fs/pstore/console-ramoops-0`).
 
-Every hardware step is behind a boot-arg and does nothing without it (`mali=1`, `touchscreen=2`,
-`buttons=2`, `mtk_cpufreq=3`, `scp_step=N`, `connsys_step=N`, `emmc_root=1`). New hardware work
+Every hardware step is behind a boot-arg and does nothing without it (here: `buttons=3`, `ufs_root=1`; the Hot 20's: `mali=1`,
+`touchscreen=2`, `buttons=2`, `mtk_cpufreq=3`, `scp_step=N`, `connsys_step=N`, `emmc_root=1`). New hardware work
 follows the same pattern: numbered steps, reading only first, each step's result said in the log.
 
 ## Rules
@@ -66,27 +70,30 @@ follows the same pattern: numbered steps, reading only first, each step's result
 - Always pass the serial (`adb -s`, `fastboot -s`); a second phone may be connected.
 - Keep the user's stock `boot_a` image; it is how the phone is restored.
 - Runs are short (200-600 s) and one at a time. Do not raise CPU or GPU voltages.
-- The eMMC driver is read only by construction; keep it so unless the owner asks otherwise.
+- The eMMC and UFS drivers are read only by construction (the UFS one sends READ CAPACITY and READ only); keep them so unless
+  the owner asks otherwise. Neither resets or re-initialises the host.
+- On a GKI phone Magisk patches `init_boot_a`, which the user does once; the tools here write `boot_a` only.
 - Nothing here needs, or should touch, Apple's servers or accounts.
 
 ## Building and running
 
-What it needs: a Mac; the common tree's branch `mtk` with this repository in `devices/x6826b`; `xnuloader/identity.h` made
+What it needs: a Mac; the common tree's branch `mtk` with this repository in `devices/x6885`; `xnuloader/identity.h` made
 from the user's own IPSW; clang and an `ld.lld` (on the PATH, or zig's in `xnu-deps/host/zig`); `adb` and `fastboot`; a rooted
 X6826B with an unlocked bootloader.
 
 ```sh
 export HAKIOS_SERIAL=...      # adb devices
-devices/x6826b/pull-firmware.sh
-make x6826b_defconfig && make kernel
+tools/x6885-facts.sh          # reads only: the live memory map, ramoops, boot_a, the UFS LUs
+tools/x6885-probe.sh          # the first run: the loader reads and reports, no XNU
+make x6885_defconfig && make kernel   # once the common tree has mtk/mt6789/
 make phone SECS=300 RAMDISK=...
 ```
 
 Or with this repository's own `tools/xnu-cycle.sh`, in the layout of the tree it was written in (`mtkloader/` and `tools/` at
 its top): `XNU_SECS=300 XNU_ARGS="..." tools/xnu-cycle.sh`.
 
-The boot partition is 33,554,432 bytes: check the size line that `build_flashed.py` prints (33,187,840 with the common tree's
-kernel and the earlier RAM disk, 30 October); the loader is built `-Os` for that reason.
+The Hot 20's boot partition was 33,554,432 bytes; a GKI phone's is usually 64 MB: read this one's with `blockdev --getsize64`
+(`tools/x6885-facts.sh` does) and give it to `chainboot.py` as `BOOT_PARTITION=`. The loader is built `-Os`.
 
 ## Reading a run's log
 
@@ -100,9 +107,9 @@ kernel and the earlier RAM disk, 30 October); the loader is built `-Os` for that
 
 ## State, briefly
 
-What works and what does not is in `device.conf` and `README.md`. The open work, in order:
-- Wi-Fi: WMT reset, function on, then the gen4m driver (docs/wifi-x6826b.md);
-- Bluetooth: HCI over STP;
-- first-use pipeline compiles in the Metal driver;
-- rounded-corner masks drawn black;
-- audio, battery, haptics.
+What works and what does not is in `device.conf` and `README.md`: on this phone nothing has run yet. The open work, in order:
+- the facts and the probe run (docs/x6885-port.md), then XNU with its root on the UFS;
+- the common tree's `mtk/mt6789/` layer;
+- touch (Goodix), the Mali-G57's bring-up and Metal on Valhall;
+- Wi-Fi and Bluetooth on the MT6789's CONNSYS; audio, battery, haptics.
+The docs about the Hot 20 (`docs/*x6826b*`) are kept: how each part was found there.

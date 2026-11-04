@@ -1,16 +1,26 @@
-# hakios-mt6768
+# hakios-mt6789
 
-HakiOS for the **Infinix Hot 20 (X6826B)**: MediaTek Helio G85 (**MT6768**), GPU **Mali-G52 MC2**, eMMC.
-iOS 16.5's own user space (launchd → backboardd → SpringBoard → apps) on Apple's open XNU kernel
-(xnu-8796.121.2), with this phone's own loader and drivers. The first MediaTek phone of the project;
-everything else in the organisation is Qualcomm.
+HakiOS for the **Infinix Hot 60 Pro (X6885)**: MediaTek Helio G200 (**MT6789**), GPU **Mali-G57 MC2**, UFS 2.2, 8 GB, a
+1224×2720 AMOLED. iOS 16.5's own user space on Apple's open XNU kernel (xnu-8796.121.2), with this phone's own loader and
+drivers, ported from the Hot 20 (X6826B, MT6768).
+
+**State: the port is written and compiles; it has not run on the phone yet.** What changed from the Hot 20, what is not done,
+and the order to run it in: [docs/x6885-port.md](docs/x6885-port.md). The table below is the Hot 20's, where all of it ran.
 
 Nothing on the phone is replaced for good: `mtkloader` sits in `boot_a` in front of Android's own kernel,
 starts XNU once when Android asks for it, and the phone comes back to Android after every run. The iOS
 system image lives in a partition of its own (`xnusys`, carved from the end of `userdata`) and the kernel
-reads it off the eMMC as it needs it.
+reads it off the flash (the UFS here, the eMMC on the Hot 20) as it needs it.
 
-## What works
+## First runs on the Hot 60 Pro
+
+```sh
+export HAKIOS_SERIAL=...      # your phone, as adb devices shows it
+tools/x6885-facts.sh          # under rooted Android, reads only: memory map, ramoops, boot_a, UFS LUs -> logs/
+tools/x6885-probe.sh          # the loader reads and reports (screen and pstore), no XNU; the stock boot_a back after
+```
+
+## What works (on the Hot 20)
 
 | | | |
 | --- | --- | --- |

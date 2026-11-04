@@ -1,5 +1,5 @@
 #!/bin/bash
-# One XNU run on the X6826B: build mtkloader (extra args go to the compiler, e.g.
+# One XNU run on the phone (the Hot 60 Pro, X6885; first the Hot 20): build mtkloader (extra args go to the compiler, e.g.
 # -DXNU_CHECKPOINT=17), pack it with Android and the XNU payload, flash boot_a, let XNU run and
 # Android come back, then print what XNU left in pstore. Slot b is never touched.
 set -e

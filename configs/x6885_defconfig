@@ -1,0 +1,7 @@
+# HakiOS defconfig for the Infinix Hot 60 Pro (x6885, MediaTek MT6789 "Helio G200"): the common kernel's configuration, the
+# SoC's facts and drivers, and this phone's own. The common repository has an mt6768 layer (the Hot 20) and no mt6789 one yet:
+# mt6789.config is to be made there, from mt6768.config with what docs/x6885-port.md lists as different (the UFS driver in
+# place of the eMMC's, the PMIC wrapper's address, the Mali-G57). Until then this does not build in the common tree.
+#include common_defconfig
+#include mt6789.config
+#include x6885.config
