@@ -8,18 +8,24 @@ Here it is for the X6826B: 4 GiB off the end of userdata becomes "xnusys", where
 userland/system.packfs lives so that mtkloader can read it straight off the flash (the eMMC
 reader in mtkloader/msdc.h). Everything else -- every other entry, the disk GUID, the entry
 order -- is left exactly as it was.
+
+The sector is the GPT's own: 512 bytes on the Hot 20's eMMC, 4096 on the Hot 60 Pro's UFS, whose
+GPT is in the user LU's 4 KB blocks (header at byte 4096). It is found from the primary image (where
+"EFI PART" is), or given as SECTOR=. <total-sectors> is in the same unit (blockdev --getsz counts
+512-byte ones: divide by 8 for a 4 KB LU).
 """
+import os
 import binascii
 import struct
 import sys
 import uuid
 
-SECTOR = 512
+SECTOR = 512                            # set by main() from the image
 SHRINK = "userdata"
 NEW_NAME = "xnusys"
-NEW_SECTORS = 8 * 1024 * 1024          # 4 GiB
+NEW_BYTES = 4 << 30                     # 4 GiB
 NEW_TYPE = uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4")   # Linux filesystem data
-ALIGN = 2048                            # 1 MiB
+ALIGN_BYTES = 1 << 20                   # 1 MiB
 
 
 def crc32(b):
@@ -53,6 +59,14 @@ def main():
     pri_path, sec_path, total = sys.argv[1], sys.argv[2], int(sys.argv[3])
     pri = bytearray(open(pri_path, "rb").read())
     sec = bytearray(open(sec_path, "rb").read())
+    global SECTOR
+    if os.environ.get("SECTOR"):
+        SECTOR = int(os.environ["SECTOR"])
+    else:
+        SECTOR = next((n for n in (512, 4096) if pri[n:n + 8] == b"EFI PART"), 0)
+        assert SECTOR, "no GPT header at byte 512 or 4096 of the primary image"
+    print(f"sectors of {SECTOR} bytes")
+    NEW_SECTORS, ALIGN = NEW_BYTES // SECTOR, ALIGN_BYTES // SECTOR
     h = parse(pri[SECTOR:2 * SECTOR])
     esz, nent = h["entsize"], h["nent"]
     ents = pri[h["entlba"] * SECTOR: h["entlba"] * SECTOR + nent * esz]

@@ -1,7 +1,14 @@
 /*
- * The buttons of the Infinix Hot 20 (X6826B), as a source of button presses for
- * /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg buttons=2: every address below
- * belongs to this phone; buttons=1 is the other phone's, in redwood_buttons.c.
+ * The buttons of the Infinix Hot 20 (X6826B, buttons=2) and the Hot 60 Pro (X6885, MT6789,
+ * buttons=3), as a source of button presses for /dev/redwood-touch (sys/redwood_input.h). Only with
+ * one of those boot-args: every address below belongs to these phones; buttons=1 is the other
+ * phone's, in redwood_buttons.c.
+ *
+ * The Hot 60 Pro has the same two parts (its tree: kp@10010000, and an MT6366, the MT6358's
+ * sibling, behind the PMIC wrapper -- at 0x10026000 on this SoC, pwrap@10026000, the WACS2
+ * registers where the MT6768's are). Its keypad map names one key, key 0 as volume down (0x72);
+ * volume up is taken to be key 1, as on the Hot 20, until keylog=1 says otherwise. The power key
+ * is the PMIC's (mt6366keys, keycode 0x74), the same TOPSTATUS bit.
  *
  * Android's own device tree says where they are (the kp@10010000 node):
  *   volume up    the SoC's keypad controller, key 0 of its map ("kpd-hw-init-map" 0x73)
@@ -26,7 +33,9 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define KPD_PHYS        0x10010000
 #define KP_MEM1         0x0004          /* keys 0..15, a bit clear while the key is down */
 
-#define PWRAP_PHYS      0x1000d000
+#define PWRAP_PHYS      0x1000d000      /* MT6768 */
+#define PWRAP_PHYS_6789 0x10026000      /* MT6789 */
+static uint32_t buttons_which;
 #define PWRAP_WACS2_CMD     0xc20
 #define PWRAP_WACS2_RDATA   0xc24
 #define PWRAP_WACS2_VLDCLR  0xc28
@@ -302,16 +311,17 @@ keys_thread(__unused void *parameter, __unused wait_result_t result)
 
 	PE_parse_boot_argn("keylog", &log, sizeof(log));
 	kpd = ml_io_map(KPD_PHYS, 0x1000);
-	pwrap = ml_io_map(PWRAP_PHYS, 0x1000);
+	pwrap = ml_io_map(buttons_which == 3 ? PWRAP_PHYS_6789 : PWRAP_PHYS, 0x1000);
 	printf("mtkkeys: the buttons are looked at every 20 ms; keypad %#x, PMIC status %s\n",
 	    rd(kpd, KP_MEM1), pwrap_wait(PWRAP_FSM_IDLE) ? "reachable" : "NOT REACHABLE");
 	{
 		uint32_t how = 0;
 
-		if (PE_parse_boot_argn("mtk_cpufreq", &how, sizeof(how)) && how != 0) {
+		/* (the Hot 20's MT6768 only: its PLL and its PMIC's rails; never on the X6885) */
+		if (buttons_which == 2 && PE_parse_boot_argn("mtk_cpufreq", &how, sizeof(how)) && how != 0) {
 			cpufreq_set(how);
 		}
-		if (PE_parse_boot_argn("mali_mhz", &how, sizeof(how)) && how != 0) {
+		if (buttons_which == 2 && PE_parse_boot_argn("mali_mhz", &how, sizeof(how)) && how != 0) {
 			gpu_raise(how);
 		}
 	}
@@ -352,9 +362,10 @@ redwood_mtkkeys_init(void)
 	uint32_t which = 0;
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("buttons", &which, sizeof(which)) || which != 2) {
+	if (!PE_parse_boot_argn("buttons", &which, sizeof(which)) || (which != 2 && which != 3)) {
 		return;
 	}
+	buttons_which = which;
 	if (kernel_thread_start(keys_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {

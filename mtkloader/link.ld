@@ -27,3 +27,6 @@ SECTIONS
     . = ALIGN(16);
     __loader_end = .;
 }
+
+/* Android's Image follows at CHAIN_OFFSET (tools/chainboot.py): start.S clears the BSS, which must end before it. */
+ASSERT(__loader_end <= 0x40080000 + 0x40000, "mtkloader: program and BSS run into Android's Image at CHAIN_OFFSET")

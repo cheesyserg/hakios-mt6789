@@ -1,13 +1,13 @@
 /*
- * Debug output for bare-metal code on the X6826B (MT6768) that runs with the MMU off:
+ * Debug output for bare-metal code on the Hot 60 Pro (X6885, MT6789) that runs with the MMU off:
  *
  *  - plog_*: the ramoops console zone that Android's pstore keeps across a warm reset. What is
  *    written here shows up after the next Android boot as /sys/fs/pstore/console-ramoops-0.
- *    Zone layout from Android's ramoops (mem 0x4d010000 size 0xe0000, console 0x40000): dump
- *    records first, then console at 0x4d09f000. Header: sig "DBGC", start (next write), size.
- *  - fbcon_*: text on the panel. The panel is video mode (td4160, BURST_VDO): OVL0 layer 0
+ *    Where the zone is comes from LK's device tree (board.h). Header: sig "DBGC", start (next
+ *    write), size.
+ *  - fbcon_*: text on the panel. The panel is video mode (see PANEL_W below): OVL0 layer 0
  *    scans LK's framebuffer continuously, so pixels written there appear on the next frame.
- *    OVL0 has per-pixel alpha enabled (LK sets aen=1), so every pixel needs alpha 0xff.
+ *    If LK enables per-pixel alpha on the layer, every pixel needs alpha 0xff (it is written so).
  *
  * Everything here is device memory (MMU off): no unaligned accesses, no SIMD, no dc zva.
  * Build with -mgeneral-regs-only -mstrict-align -fno-builtin.
@@ -18,15 +18,26 @@
 #include <stdint.h>
 #include "font8x16.h"
 
-#define RAMOOPS_CONSOLE      0x4d09f000ULL
-#define RAMOOPS_CONSOLE_SIZE 0x40000u
+/*
+ * Android's ramoops zones. Their place is the device tree's (board.h reads it out of LK's tree at
+ * entry and sets these); until then, and on a phone whose tree has no ramoops, they point at a
+ * buffer of our own, so that nothing is ever written to DRAM nobody said was ours.
+ */
 #define RAMOOPS_SIG          0x43474244u
+#define RAMOOPS_SCRATCH      0x4000u
+static uint8_t ramoops_scratch[2][RAMOOPS_SCRATCH] __attribute__((aligned(4096)));
+static uint64_t ramoops_console = (uint64_t)ramoops_scratch[0];
+static uint32_t ramoops_console_size = RAMOOPS_SCRATCH;
+static uint64_t ramoops_pmsg = (uint64_t)ramoops_scratch[1];
+static uint32_t ramoops_pmsg_size = RAMOOPS_SCRATCH;
+#define RAMOOPS_CONSOLE      ramoops_console
+#define RAMOOPS_CONSOLE_SIZE ramoops_console_size
 /* the pmsg zone: Android's request for one XNU boot comes in it (boot-xnu.sh), the kernel's lines for the
  * host go out in it (kern.redwood.host_keep) */
-#define RAMOOPS_PMSG         0x4d0e0000ULL
-#define RAMOOPS_PMSG_SIZE    0x10000u
+#define RAMOOPS_PMSG         ramoops_pmsg
+#define RAMOOPS_PMSG_SIZE    ramoops_pmsg_size
 
-#define TOPRGU_BASE          0x10007000ULL
+#define TOPRGU_BASE          0x10007000ULL      /* the same on the MT6789 (mediatek,mt6789-wdt) */
 #define TOPRGU_MODE          (TOPRGU_BASE + 0x00)
 #define TOPRGU_LENGTH        (TOPRGU_BASE + 0x04)
 #define TOPRGU_RESTART       (TOPRGU_BASE + 0x08)
@@ -35,21 +46,39 @@
 #define TOPRGU_RESTART_KEY   0x1971u
 #define TOPRGU_SWRST_KEY     0x1209u
 
-/* LK's framebuffer (mblock "framebuffer"), the layer LK shows the logo on. */
-#define LK_FB_BASE           0x787b0000ULL
-#define LK_FB_SIZE           0x1050000ULL
-#define LK_FB_PITCH          2944u      /* 736 pixels: LK aligns the width to 32 */
-#define PANEL_W              720u
-#define PANEL_H              1640u
+/*
+ * The panel: the X6885's AMOLED, 1224 x 2720, a Novatek NT37706A or a Visionox VTDR6126A
+ * (Android's panel drivers for this phone are nt37706a_fhdp_dsi_vdo_dsc_vxn_vxn_144hz_x6885 and
+ * vtdr6126a_fhdp_dsi_vdo_dsc_tm_tm_144hz_x6885): video mode, with DSC after the OVL. So, as on
+ * the Hot 20, OVL0 keeps scanning LK's framebuffer and what is written there is shown on the next
+ * frame. The size is read back from OVL0's ROI (display_find); these are what it should say.
+ */
+#define PANEL_W_DEFAULT      1224u
+#define PANEL_H_DEFAULT      2720u
+static uint32_t panel_w = PANEL_W_DEFAULT, panel_h = PANEL_H_DEFAULT;
+#define PANEL_W              panel_w
+#define PANEL_H              panel_h
 
-#define DISP_MUTEX_EN        0x14001020ULL
-#define DISP_MUTEX_RUN       0x14001024ULL
+/* MT6789 display blocks (Android's tree: disp_mutex@14001000, disp_ovl0@14005000, dsi@14013000) */
+#define DISP_MUTEX_BASE      0x14001000ULL
+#define DISP_MUTEX_EN        (DISP_MUTEX_BASE + 0x20)
+#define DISP_MUTEX_RUN       (DISP_MUTEX_BASE + 0x24)
 
-#define OVL0_BASE            0x1400b000ULL
+#define OVL0_BASE_DEFAULT    0x14005000ULL
+static uint64_t ovl0_base = OVL0_BASE_DEFAULT;
+#define OVL0_BASE            ovl0_base
+#define OVL_STA              0x000
+#define OVL_EN               0x00c
+#define OVL_ROI_SIZE         0x020      /* height << 16 | width */
 #define OVL_SRC_CON          0x02c      /* a bit per layer the hardware composes */
 #define OVL_L0_CON           0x030
+#define OVL_L0_SRC_SIZE      0x038
 #define OVL_L0_PITCH         0x044
 #define OVL_L0_ADDR          0xf40
+
+#define DSI0_BASE_DEFAULT    0x14013000ULL
+#define DSI_START            0x000
+#define DSI_MODE_CTRL        0x014      /* bits 1:0: 0 command mode, 1 sync pulse, 2 sync event, 3 burst video */
 
 static inline uint32_t rd32(uint64_t a) { return *(volatile uint32_t *)a; }
 static inline void wr32(uint64_t a, uint32_t v) { *(volatile uint32_t *)a = v; }

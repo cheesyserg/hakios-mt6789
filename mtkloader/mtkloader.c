@@ -1,6 +1,7 @@
 /*
- * mtkloader: boots XNU on the Infinix Hot 20 (X6826B, MT6768) from boot_a, and brings Android
- * back afterwards with XNU's log in pstore.
+ * mtkloader: boots XNU on the Infinix Hot 60 Pro (X6885, MT6789) from boot_a, and brings Android
+ * back afterwards with XNU's log in pstore. (It was written for the Hot 20, X6826B / MT6768; what
+ * only that phone has -- its TD4160 touch firmware, its ARMPLL -- is behind HAKIOS_X6826B.)
  *
  * The boot image's kernel (tools/chainboot.py) is this program, then Android's own kernel Image
  * at CHAIN_OFFSET, then the XNU payload ("XNUP": kernel, ramdisk). Each boot, by the marker:
@@ -14,23 +15,50 @@
  * The log ends up in /sys/fs/pstore/console-ramoops-0 under Android. See mtkdbg.h for the
  * screen and ramoops output.
  *
- * Display: the panel is video mode and keeps scanning OVL0 layer 0 (LK's framebuffer,
- * 0x787b0000, pitch 2944 = 736 pixels). LK enables per-pixel alpha on that layer, and XNU's
- * console writes 0x00rrggbb pixels: fully transparent. So per-pixel alpha is switched off, and
- * XNU's color table gets alpha 0xff besides.
+ * Display: the panel is video mode and keeps scanning OVL0 layer 0 (LK's framebuffer, wherever
+ * OVL0's layer 0 address register says). If LK enables per-pixel alpha on that layer, XNU's
+ * console writing 0x00rrggbb pixels would be fully transparent: so per-pixel alpha is switched
+ * off, and XNU's color table gets alpha 0xff besides.
+ *
+ * The phone is not assumed: the device tree LK hands over says where DRAM, ramoops and the
+ * blocks are (board.h), and each range of DRAM written here is checked against it first
+ * (board_check). BOARD_PROBE=1 only reads and reports: run it first on a new phone.
  */
 #include <stdint.h>
 #include <stddef.h>
+
+/* 1: the Hot 20's own hardware steps (its TD4160 touch firmware over SPI2, its ARMPLL); 0 on any other phone. */
+#ifndef HAKIOS_X6826B
+#define HAKIOS_X6826B       0
+#endif
 #include "mtkdbg.h"
+#include "board.h"
+
+#if HAKIOS_X6826B
 #include "msdc.h"
 #include "mtkspi.h"
 #include "tcm.h"
+#endif
 #include "../xnuloader/identity.h"
 
-/* XNU's view of memory: one contiguous range that nothing else (LK, Android, TEE, ATF, the
- * framebuffer) uses; 0xc0000000-0xfe000000 is free DRAM on this board. */
-#define XNU_PHYS_BASE       0xc0000000ULL
-#define XNU_MEM_SIZE        0xfe000000ULL       /* up to dramc-rk1 at 0x1bffff000; room for the system image */
+/*
+ * XNU's view of memory: one contiguous range that nothing else (LK, Android, TEE, ATF, the
+ * framebuffer) uses. The Hot 60 Pro has 8 GB from 0x40000000; MediaTek's reserved regions sit in
+ * the low 4 GB, so XNU takes 4 GB of the top: 0x140000000-0x240000000. Below it, 16 MB of our own
+ * (BOARD_SCRATCH): the run marker, the panic log, the UFS window. board_check() refuses the run if
+ * LK's tree says any of it is taken.
+ */
+#ifndef XNU_PHYS_BASE
+#define XNU_PHYS_BASE       0x140000000ULL
+#endif
+#ifndef XNU_MEM_SIZE
+#define XNU_MEM_SIZE        0x100000000ULL
+#endif
+#define BOARD_SCRATCH       (XNU_PHYS_BASE - 0x1000000ULL)
+#define BOARD_SCRATCH_SIZE  0x1000000ULL
+#define UFS_DMA_PA          (BOARD_SCRATCH + 0x200000ULL)
+#include "ufs.h"
+
 /* Where the system image is put, clear of the kernel, as xnuloader does it (RESIDENT_RD_OFFSET). */
 #define SYSTEM_PA           (XNU_PHYS_BASE + 0x08000000ULL)
 #define SYSTEM_PART         "xnusys"
@@ -68,7 +96,7 @@ _Static_assert(XNU_CORES >= 1 && XNU_CORES <= 7, "one core at least, and one lef
 
 /*
  * The processors in the order the kernel is offered them: the one this code runs on first (LK
- * leaves us on core 0), then the two Cortex-A75s, which are about twice the Cortex-A55s, then
+ * leaves us on core 0), then the two Cortex-A76s (MPIDR 0x600 and 0x700, where the Hot 20's A75s were), then
  * the rest of the A55s. So "cpus=3" already gives iOS both fast cores.
  */
 static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
@@ -86,13 +114,22 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #ifndef TOUCH_PROBE
 #define TOUCH_PROBE         0
 #endif
+#if TOUCH_PROBE && !HAKIOS_X6826B
+#error "TOUCH_PROBE is the Hot 20's TD4160: HAKIOS_X6826B=1"
+#endif
 /* 1: wake the GPU and ask it what it is, if Android asked for it (tools/gpu-probe.sh); then Android. */
 #ifndef GPU_PROBE
 #define GPU_PROBE           0
 #endif
+#if GPU_PROBE && !HAKIOS_X6826B
+#error "GPU_PROBE is the Hot 20's Mali-G52 and MT6358 wrapper at 0x1000d000: HAKIOS_X6826B=1"
+#endif
 /* 1: read the eMMC and report, then go back to Android (no XNU). */
 #ifndef MSDC_TEST
 #define MSDC_TEST           0
+#endif
+#if MSDC_TEST && !HAKIOS_X6826B
+#error "MSDC_TEST reads the Hot 20's eMMC: HAKIOS_X6826B=1"
 #endif
 /* 1: check at EL1 that the timer interrupts arrive at all (diagnostics, leaves GIC state). */
 #ifndef TIMER_PROBE
@@ -126,7 +163,8 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #define XNU_ROOT_EMMC       1
 #endif
 #if XNU_ROOT_EMMC
-#define XNU_ROOT_ARG        "rd=md0 emmc_root=1"     /* (rd=md0 for libignition's "ramdisk" boot) */
+/* (the name is the Hot 20's: on this phone the flash is UFS, bsd/dev/redwood_ufs.c) */
+#define XNU_ROOT_ARG        "rd=md0 ufs_root=1"      /* (rd=md0 for libignition's "ramdisk" boot) */
 #else
 #define XNU_ROOT_ARG        "rd=md0"
 #endif
@@ -137,11 +175,16 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #endif
 
 #define CHAIN_OFFSET        0x40000u
+/*
+ * Android's Image goes back to where LK entered this program (start.S keeps it in lk_entry_pa):
+ * that is where LK would have put it -- 0x40000000 on the Hot 60 Pro, whose GKI Image has a
+ * text_offset of 0 and wants a 2 MB aligned base. KERNEL_PA is only the fallback.
+ */
 #define KERNEL_PA           0x40080000ULL
-#define CHAIN_STUB_PA       0x4a000000ULL
+uint64_t lk_entry_pa;
 
 /* Run state, kept in DRAM across the watchdog reset (three copies: a bit may flip). */
-#define MARKER_PA           0x80000000ULL
+#define MARKER_PA           BOARD_SCRATCH
 #define MARK_RUNNING        0x4e52584eu /* "NXRN" */
 #define MARK_DONE           0x4e44584eu /* "NXDN" */
 
@@ -303,7 +346,7 @@ size_t strlen(const char *s)
 }
 
 /* 0 when the first n bytes are the same; device memory, so byte by byte. */
-static int memcmp_n(const volatile void *a, const void *b, size_t n)
+static int __attribute__((unused)) memcmp_n(const volatile void *a, const void *b, size_t n)
 {
 	const volatile uint8_t *x = a;
 	const uint8_t *y = b;
@@ -383,8 +426,14 @@ static void out_dec(uint64_t v)
 
 /* ---- run state ---- */
 
+/* 1 once board_check() found the scratch range free: until then the marker is not touched */
+static int board_ok;
+
 static void marker_set(uint32_t v)
 {
+	if (!board_ok) {
+		return;
+	}
 	for (int i = 0; i < 3; i++) {
 		wr32(MARKER_PA + 64 * i, v);
 	}
@@ -392,6 +441,9 @@ static void marker_set(uint32_t v)
 
 static uint32_t marker_get(void)
 {
+	if (!board_ok) {
+		return 0;
+	}
 	uint32_t a = rd32(MARKER_PA), b = rd32(MARKER_PA + 64), c = rd32(MARKER_PA + 128);
 	return (a == b || a == c) ? a : (b == c ? b : 0);
 }
@@ -401,15 +453,40 @@ static uint32_t marker_get(void)
 static uint64_t fb_base;
 static uint32_t fb_pitch;
 
-/* LK's layer as OVL0 scans it, if it is where LK said; LK's values otherwise. */
+/* 1 if [base, base + size) lies in one of LK's DRAM banks */
+static int in_dram(uint64_t base, uint64_t size)
+{
+	for (uint32_t i = 0; i < board.nmem; i++) {
+		if (base >= board.mem[i].base && base + size <= board.mem[i].base + board.mem[i].size) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * LK's layer as OVL0 scans it: its address, its pitch, the size OVL0 composes (ROI). The panel's
+ * size is taken from the ROI if it says something a phone could have; the framebuffer only if it
+ * lies in DRAM. With none, fb_base stays 0 and nothing is drawn (the log still goes to ramoops).
+ */
 static void display_find(void)
 {
+	if (board.ovl0_base) {
+		ovl0_base = board.ovl0_base;
+	}
+	uint32_t roi = rd32(OVL0_BASE + OVL_ROI_SIZE);
+	uint32_t w = roi & 0x1fff, h = (roi >> 16) & 0x1fff;
+	if (w >= 320 && w <= 4096 && h >= 320 && h <= 4096) {
+		panel_w = w;
+		panel_h = h;
+	}
 	uint32_t addr = rd32(OVL0_BASE + OVL_L0_ADDR);
 	uint32_t pitch = rd32(OVL0_BASE + OVL_L0_PITCH) & 0xffff;
 
-	fb_base = LK_FB_BASE;
-	fb_pitch = LK_FB_PITCH;
-	if (addr >= LK_FB_BASE && addr < LK_FB_BASE + LK_FB_SIZE && pitch >= PANEL_W * 4 && pitch <= 4096) {
+	fb_base = 0;
+	fb_pitch = 0;
+	if (addr && pitch >= PANEL_W * 4 && pitch <= PANEL_W * 4 + 1024 &&
+	    (!board.dt_ok || in_dram(addr, (uint64_t)pitch * PANEL_H))) {
 		fb_base = addr;
 		fb_pitch = pitch;
 	}
@@ -540,62 +617,49 @@ static uint64_t kva_to_pa(uint64_t va)
  * so it lives in its own partition (tools/gpt-carve.py made "xnusys" out of the end of userdata)
  * and is read into DRAM here. The payload's small root.packfs stays the second disk (md1).
  */
-static uint8_t gpt_entries[128 * 128] __attribute__((aligned(16)));
-static uint8_t sector_buf[512] __attribute__((aligned(16)));
-
-/* The partition's first block and length, by the name in the GPT. */
-static int gpt_find(const char *name, uint64_t *lba, uint64_t *blocks)
+/* The UFS host as LK left it, and SYSTEM_PART in the GPT of one of its LUs (ufs.h). */
+static int system_find(void)
 {
-	if (!msdc_read(1, 1, sector_buf)) {
+	if (!ufs.ready && !ufs_attach(board.ufs_base)) {
+		out("UFS: ");
+		out(ufs.what);
+		out(" (");
+		out_hex(ufs.status);
+		out(")\n");
 		return 0;
 	}
-	if (memcmp_n(sector_buf, "EFI PART", 8)) {
-		return 0;
-	}
-	uint64_t ent_lba = *(volatile uint64_t *)(sector_buf + 72);
-	uint32_t count = *(volatile uint32_t *)(sector_buf + 80);
-	uint32_t size = *(volatile uint32_t *)(sector_buf + 84);
-
-	if (count > 128 || size != 128) {
-		return 0;
-	}
-	if (!msdc_read(ent_lba, count * size / 512, gpt_entries)) {
-		return 0;
-	}
-	for (uint32_t i = 0; i < count; i++) {
-		const uint8_t *e = gpt_entries + i * size;
-		int same = 1;
-
-		for (int k = 0; same && name[k - (k ? 0 : 0)] != 0; k++) {
-			same = e[56 + 2 * k] == (uint8_t)name[k] && e[57 + 2 * k] == 0;
+	if (!ufs.part_blocks && !ufs_find_part(SYSTEM_PART)) {
+		out("no " SYSTEM_PART " partition in the GPT of any LU");
+		if (ufs.lun != 0xff) {
+			out(" (a GPT is on LU ");
+			out_dec(ufs.lun);
+			out(")");
 		}
-		if (same && e[56 + 2 * (int)strlen(name)] == 0) {
-			uint64_t first = *(const volatile uint64_t *)(e + 32);
-			uint64_t last = *(const volatile uint64_t *)(e + 40);
-			if (first == 0 || last < first) {
-				return 0;
-			}
-			*lba = first;
-			*blocks = last - first + 1;
-			return 1;
-		}
+		out("; last: ");
+		out(ufs.what ? ufs.what : "-");
+		out("\n");
+		return 0;
 	}
-	return 0;
+	return 1;
 }
 
 /* Reads the image into SYSTEM_PA; returns its length, 0 if there is none to read. */
 static uint64_t load_system_image(void)
 {
-	uint64_t lba, blocks, size = 0, done = 0, t0 = dbg_ticks(), f = dbg_freq();
+	uint64_t size = 0, done = 0, t0 = dbg_ticks(), f = dbg_freq();
+	static uint8_t first[4096] __attribute__((aligned(16)));
 
-	if (!gpt_find(SYSTEM_PART, &lba, &blocks)) {
-		out("no " SYSTEM_PART " partition on the flash (or the GPT could not be read)\n");
+	if (!system_find()) {
 		return 0;
 	}
-	out(SYSTEM_PART " at block ");
-	out_hex(lba);
+	uint32_t bs = ufs.block_size;
+	uint64_t part_bytes = ufs.part_blocks * bs;
+	out(SYSTEM_PART " on LU ");
+	out_dec(ufs.lun);
+	out(" at block ");
+	out_hex(ufs.part_lba);
 	out(", ");
-	out_dec(blocks / 2048);
+	out_dec(part_bytes >> 20);
 	out(" MB\n");
 
 	/*
@@ -604,31 +668,31 @@ static uint64_t load_system_image(void)
 	 * back (the cryptexes come that way), so follow them until one does not begin with NXSB.
 	 */
 	for (uint64_t at = 0;;) {
-		if (!msdc_read(lba + at / 512, 1, sector_buf)) {
+		if (at % bs || !ufs_read_part(at, bs, first)) {
 			out("cannot read it: ");
-			out(msdc_last.what);
+			out(at % bs ? "a container not on a block" : ufs.what);
 			out("\n");
 			return 0;
 		}
-		if (*(volatile uint32_t *)(sector_buf + 32) != 0x4253584eu) { /* "NXSB" */
+		if (*(volatile uint32_t *)(first + 32) != 0x4253584eu) { /* "NXSB" */
 			break;
 		}
-		uint32_t bs = *(volatile uint32_t *)(sector_buf + 36);
-		uint64_t count = *(volatile uint64_t *)(sector_buf + 40);
+		uint32_t abs = *(volatile uint32_t *)(first + 36);
+		uint64_t count = *(volatile uint64_t *)(first + 40);
 
-		if (bs < 512 || bs > 65536 || count == 0 || count > blocks) {
+		if (abs < 512 || abs > 65536 || count == 0 || count * abs > part_bytes - at) {
 			out("the APFS container at ");
 			out_dec(at / 1024 / 1024);
 			out(" MB says ");
 			out_dec(count);
 			out(" blocks of ");
-			out_dec(bs);
+			out_dec(abs);
 			out(": that cannot be\n");
 			return 0;
 		}
-		at += count * bs;
+		at += count * abs;
 		size = at;
-		if (at >= blocks * 512) {
+		if (at >= part_bytes) {
 			break;
 		}
 	}
@@ -636,6 +700,7 @@ static uint64_t load_system_image(void)
 		out("no APFS container there (write userland/system.apfs to it)\n");
 		return 0;
 	}
+	size = (size + bs - 1) / bs * bs;
 	out("APFS: ");
 	out_dec(size / 1024 / 1024);
 	out(" MB\n");
@@ -653,20 +718,19 @@ static uint64_t load_system_image(void)
 	out(": ");
 	uint32_t last_shown = 0;
 	while (done < size) {
-		uint64_t left = (size - done + 511) / 512;
-		uint32_t n = left > 4096 ? 4096 : (uint32_t)left;   /* 2 MB at a time */
+		uint64_t n = size - done > 0x200000 ? 0x200000 : size - done;   /* 2 MB at a time */
 
-		if (!msdc_read(lba + done / 512, n, (void *)(SYSTEM_PA + done))) {
+		if (!ufs_read_part(done, n, (void *)(SYSTEM_PA + done))) {
 			out("\nfailed at ");
 			out_dec(done / 1024 / 1024);
 			out(" MB: ");
-			out(msdc_last.what);
+			out(ufs.what);
 			out(" status ");
-			out_hex(msdc_last.status);
+			out_hex(ufs.status);
 			out("\n");
 			return 0;
 		}
-		done += (uint64_t)n * 512;
+		done += n;
 		uint32_t pct = (uint32_t)(done * 100 / size);
 		if (pct >= last_shown + 10) {
 			last_shown = pct - pct % 10;
@@ -802,10 +866,10 @@ static void build_nvram_image(uint8_t *image)
 }
 
 /* Panic log region (the device tree's "pram"): DRAM outside XNU's window, kept across a reset. */
-#define PANIC_LOG_BASE 0x80100000ULL
+#define PANIC_LOG_BASE (BOARD_SCRATCH + 0x100000ULL)
 #define PANIC_LOG_SIZE 0x80000u
 
-/* As xnuloader/loader.c builds it for x6826b, minus what needs UEFI. */
+/* As xnuloader/loader.c builds it (for the x6826b first), minus what needs UEFI. */
 static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_size,
     uint64_t sys_pa, uint64_t sys_size)
 {
@@ -829,12 +893,12 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 	dt_prop_u32(&w, "#size-cells", 2);
 
 	dt_begin(&w, "chosen");
-	dt_prop_str(&w, "darwin-board", "x6826b");
+	dt_prop_str(&w, "darwin-board", "x6885");
 	dt_prop(&w, "random-seed", seed, sizeof(seed));
 	dt_prop_u64(&w, "dram-base", XNU_PHYS_BASE);
 	dt_prop_u64(&w, "dram-size", XNU_MEM_SIZE);
 	dt_prop_u32(&w, "debug-enabled", 1);
-	dt_prop_u32(&w, "display-scale", 2);
+	dt_prop_u32(&w, "display-scale", PANEL_W >= 1080 ? 3 : 2);
 	dt_prop_u32(&w, "display-rotation", 0);
 	dt_prop_str(&w, "psci-method", "smc");
 	static const uint8_t wifi_address[6] = { 0x02, 0x52, 0x44, 0x57, 0x00, 0x01 };
@@ -919,7 +983,7 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
 		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
-		if (core < 6) { /* cores 0-5 are the Cortex-A55s, 6 and 7 the A75s */
+		if (core < 6) { /* cores 0-5 are the Cortex-A55s, 6 and 7 the A76s */
 			dt_prop_u32(&w, "small-core", 1);
 		}
 		dt_end(&w);
@@ -927,7 +991,7 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 	dt_end(&w);
 
 	dt_begin(&w, "arm-io");
-	dt_prop_str(&w, "device_type", "x6826b");
+	dt_prop_str(&w, "device_type", "x6885");
 	uint64_t ranges[3] = { 0, 0x0c000000, 0x14000000 };
 	dt_prop(&w, "ranges", ranges, sizeof(ranges));
 	dt_prop_u32(&w, "#address-cells", 2);
@@ -983,14 +1047,21 @@ static void __attribute__((noreturn)) chain_android(void)
 #endif
 	out("starting Android\n");
 
-	volatile uint32_t *dst = (volatile uint32_t *)CHAIN_STUB_PA;
+	/*
+	 * The stub runs from just past this image (image_size, rounded up by chainboot.py, which also
+	 * keeps that clear of LK's device tree): neither the Image's old place nor its new one reaches
+	 * there, since the new one is at most CHAIN_OFFSET below the old.
+	 */
+	uint64_t entry = lk_entry_pa ? lk_entry_pa : KERNEL_PA;
+	uint64_t stub_pa = ((uint64_t)_start + hdr[2] + 0xfff) & ~0xfffULL;
+	volatile uint32_t *dst = (volatile uint32_t *)stub_pa;
 	const volatile uint32_t *src = (const volatile uint32_t *)chain_stub;
 	for (uint64_t i = 0; i < (uint64_t)(chain_stub_end - chain_stub) / 4; i++) {
 		dst[i] = src[i];
 	}
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
-	void (*stub)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) = (void *)CHAIN_STUB_PA;
-	stub(lk_dtb, KERNEL_PA, (uint64_t)img, image_size, KERNEL_PA);
+	void (*stub)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) = (void *)stub_pa;
+	stub(lk_dtb, entry, (uint64_t)img, image_size, entry);
 	__builtin_unreachable();
 }
 
@@ -1352,7 +1423,7 @@ static void read_screen(void)
 	uint64_t font = xsyms.iso_font ? kva_to_pa(xsyms.iso_font) : 0;
 	const uint32_t cols = PANEL_W / 8, rows = PANEL_H / 16;
 	uint32_t lit_cells = 0, known = 0, last_row = 0;
-	static char line[PANEL_W / 8 + 1];
+	static char line[4096 / 8 + 1];         /* (the widest panel display_find accepts) */
 
 	if (!font || !fb_base) {
 		return;
@@ -1930,6 +2001,310 @@ static void watcher_start(void)
 	out(watcher_started ? ", running\n" : ", not seen\n");
 }
 
+/* ---- the board: what LK's tree says, and whether the ranges we write are free ---- */
+
+/* 1 on a new phone: read and report (screen and ramoops), then Android; XNU is not started. */
+#ifndef BOARD_PROBE
+#define BOARD_PROBE         0
+#endif
+
+static void say_range(const char *what, uint64_t base, uint64_t size)
+{
+	out(what);
+	out(" ");
+	out_hex(base);
+	out("+");
+	out_hex(size);
+}
+
+/*
+ * Every range of DRAM this program writes, against LK's map. XNU's window and our scratch must be
+ * DRAM and nobody's; the image itself (and the stub's page past it) is where LK put it, so only
+ * said. Nothing of DRAM outside our own image is written before this has said yes (board_ok).
+ */
+static int board_check(void)
+{
+	static const struct { const char *what; uint64_t base, size; } mine[] = {
+		{ "XNU's memory", XNU_PHYS_BASE, XNU_MEM_SIZE },
+		{ "scratch (marker, panic log, UFS window)", BOARD_SCRATCH, BOARD_SCRATCH_SIZE },
+	};
+	const char *why;
+	int ok = board.dt_ok;
+
+	if (!ok) {
+		out("board: no device tree from LK at x0: no DRAM of ours is checked, so none is written and XNU does not run\n");
+	}
+	for (unsigned i = 0; ok && i < sizeof(mine) / sizeof(mine[0]); i++) {
+		int r = board_range_free(mine[i].base, mine[i].size, &why);
+		if (r != 0) {
+			out("board: ");
+			say_range(mine[i].what, mine[i].base, mine[i].size);
+			out(r < 0 ? ": " : ": on the reserved ");
+			out(why);
+			if (r > 0) {
+				out(" ");
+				out_hex(board.rsv[r - 1].base);
+				out("+");
+				out_hex(board.rsv[r - 1].size);
+			}
+			out(" -- no run (XNU_PHYS_BASE, XNU_MEM_SIZE)\n");
+			ok = 0;
+		}
+	}
+	{
+		const volatile uint64_t *hdr = (const volatile uint64_t *)_start;
+		uint64_t img = (uint64_t)_start, len = hdr[2] + 0x1000;
+		int r = board_range_free(img, len, &why);
+		if (r != 0) {
+			say_range("board: (said only) this image", img, len);
+			out(r < 0 ? ": " : " overlaps the reserved ");
+			out(why);
+			out("\n");
+		}
+	}
+	board_ok = ok;
+	return ok;
+}
+
+/* ramoops where LK's tree has it */
+static void board_apply(void)
+{
+	if (board.console_pa && board.console_size >= 4096 && in_dram(board.console_pa, board.console_size)) {
+		ramoops_console = board.console_pa;
+		ramoops_console_size = board.console_size;
+	}
+	if (board.pmsg_pa && board.pmsg_size >= 4096 && in_dram(board.pmsg_pa, board.pmsg_size)) {
+		ramoops_pmsg = board.pmsg_pa;
+		ramoops_pmsg_size = board.pmsg_size;
+	}
+	if (board.ufs_base) {
+		ufs.base = board.ufs_base;
+	}
+}
+
+static void board_say_ramoops(void)
+{
+	out("ramoops: ");
+	if (!board.ramoops_base) {
+		out("none in LK's tree or command line: the log goes to the screen only\n");
+		return;
+	}
+	say_range("", board.ramoops_base, board.ramoops_size);
+	out(" record ");
+	out_hex(board.record_size);
+	out(" console ");
+	out_hex(board.console_size);
+	out(" at ");
+	out_hex(board.console_pa);
+	out(" pmsg ");
+	out_hex(board.pmsg_size);
+	out(" at ");
+	out_hex(board.pmsg_pa);
+	out(" ftrace ");
+	out_hex(board.ftrace_size);
+	if (board.ecc_size) {
+		out(" ECC: not written");
+	}
+	out(ramoops_console == board.console_pa ? " (in use)\n" : " (not used)\n");
+}
+
+/* The phone as LK leaves it: its tree, the display, the UFS host. Reads only. */
+static void board_report(int all)
+{
+	uint64_t el;
+	__asm__ volatile("mrs %0, CurrentEL" : "=r"(el));
+	out("entered at ");
+	out_hex(lk_entry_pa);
+	out(", running at ");
+	out_hex((uint64_t)_start);
+	out(", EL");
+	out_dec((el >> 2) & 3);
+	out(", image_size ");
+	out_hex(((const volatile uint64_t *)_start)[2]);
+	out(", LK dtb ");
+	out_hex(lk_dtb);
+	out(board.dt_ok ? " (read)\n" : " (NOT a device tree)\n");
+	for (uint32_t i = 0; i < board.nmem; i++) {
+		say_range("DRAM", board.mem[i].base, board.mem[i].size);
+		out("\n");
+	}
+	out("reserved: ");
+	out_dec(board.nrsv);
+	out(board.nrsv == BOARD_MAX_RSV ? " (the list is full: more not seen)\n" : "\n");
+	for (uint32_t i = 0; all && i < board.nrsv; i++) {
+		out("  ");
+		say_range(board.rsv[i].name, board.rsv[i].base, board.rsv[i].size);
+		out("\n");
+	}
+	board_say_ramoops();
+	if (all) {
+		out("bootargs: ");
+		out(board.bootargs);
+		out("\n");
+	}
+	out("blocks: ufs ");
+	out_hex(board.ufs_base);
+	out(" ovl0 ");
+	out_hex(board.ovl0_base);
+	out(" dsi0 ");
+	out_hex(board.dsi0_base);
+	out(" mutex ");
+	out_hex(board.mutex_base);
+	out(" mali ");
+	out_hex(board.mali_base);
+	out(" msdc1 ");
+	out_hex(board.msdc1_base);
+	out(" kp ");
+	out_hex(board.keypad_base);
+	out(" pwrap ");
+	out_hex(board.pwrap_base);
+	out("\n");
+
+	out("display: OVL0 ");
+	out_hex(OVL0_BASE);
+	out(" EN ");
+	out_hex(rd32(OVL0_BASE + OVL_EN));
+	out(" ROI ");
+	out_hex(rd32(OVL0_BASE + OVL_ROI_SIZE));
+	out(" SRC_CON ");
+	out_hex(rd32(OVL0_BASE + OVL_SRC_CON));
+	out(" L0_CON ");
+	out_hex(rd32(OVL0_BASE + OVL_L0_CON));
+	out(" L0 ");
+	out_hex(rd32(OVL0_BASE + OVL_L0_ADDR));
+	out(" pitch ");
+	out_dec(rd32(OVL0_BASE + OVL_L0_PITCH) & 0xffff);
+	{
+		uint64_t dsi = board.dsi0_base ? board.dsi0_base : DSI0_BASE_DEFAULT;
+		uint32_t mode = rd32(dsi + DSI_MODE_CTRL) & 3;
+		out(" DSI0 mode ");
+		out_dec(mode);
+		out(mode ? " (video)" : " (COMMAND: nothing drawn is shown without a frame sent)");
+	}
+	out("\npanel ");
+	out_dec(PANEL_W);
+	out("x");
+	out_dec(PANEL_H);
+	out(", framebuffer ");
+	out_hex(fb_base);
+	out(" pitch ");
+	out_dec(fb_pitch);
+	out(fb_base ? "\n" : " (none found: nothing drawn)\n");
+
+	out("UFS ");
+	out_hex(ufs.base);
+	out(": CAP ");
+	out_hex(ufs_rd(UFS_CAP));
+	out(" VER ");
+	out_hex(ufs_rd(UFS_VER));
+	out(" HCE ");
+	out_hex(ufs_rd(UFS_HCE));
+	out(" HCS ");
+	out_hex(ufs_rd(UFS_HCS));
+	out(" IS ");
+	out_hex(ufs_rd(UFS_IS));
+	out(" IE ");
+	out_hex(ufs_rd(UFS_IE));
+	out("\n  UTRL ");
+	out_hex((uint64_t)ufs_rd(UFS_UTRLBAU) << 32 | ufs_rd(UFS_UTRLBA));
+	out(" RSR ");
+	out_hex(ufs_rd(UFS_UTRLRSR));
+	out(" DBR ");
+	out_hex(ufs_rd(UFS_UTRLDBR));
+	out(" REFCLK ");
+	out_hex(ufs_rd(UFS_MTK_REFCLK_CTRL));
+	out("\n");
+}
+
+/* The LUs one by one (capacity, a GPT or not), then SYSTEM_PART. Needs board_ok (the UFS window). */
+static void __attribute__((unused)) board_probe_ufs(void)
+{
+	if (!board_ok) {
+		out("UFS: not tried, the scratch range is not known to be free\n");
+		return;
+	}
+	if (!ufs_attach(ufs.base)) {
+		out("UFS: ");
+		out(ufs.what);
+		out(" ");
+		out_hex(ufs.status);
+		out("\n");
+		return;
+	}
+	out("UFS: attached, ");
+	out(ufs.own_list ? "our own request list" : "LK's request list");
+	out(" at ");
+	out_hex(ufs.list);
+	out(", slot ");
+	out_dec(ufs.slot);
+	out("\n");
+	for (uint32_t lun = 0; lun < 8; lun++) {
+		uint64_t blocks;
+		uint32_t bs;
+		out("  LU ");
+		out_dec(lun);
+		if (!ufs_capacity(lun, &blocks, &bs)) {
+			out(": ");
+			out(ufs.what);
+			out(" ");
+			out_hex(ufs.status);
+			out("\n");
+			continue;
+		}
+		out(": ");
+		out_dec(blocks * bs >> 20);
+		out(" MB in blocks of ");
+		out_dec(bs);
+		int r = ufs_gpt_find(lun, "boot_a");
+		out(r < 0 ? ", no GPT\n" : r ? ", GPT with boot_a\n" : ", GPT without boot_a\n");
+	}
+	ufs.part_blocks = 0;
+	if (system_find()) {
+		out(SYSTEM_PART ": LU ");
+		out_dec(ufs.lun);
+		out(" block ");
+		out_hex(ufs.part_lba);
+		out(", ");
+		out_dec(ufs.part_blocks * ufs.block_size >> 20);
+		out(" MB\n");
+	}
+}
+
+/* The watchdog, while reading blocks that might not answer: a hung read resets into Android. */
+static void __attribute__((unused)) probe_guard(uint32_t seconds)
+{
+	if (!seconds) {
+		wdt_disable();
+		return;
+	}
+	wr32(TOPRGU_LENGTH, ((seconds * 32768u / 512u) << 5) | 0x8u);
+	wr32(TOPRGU_RESTART, TOPRGU_RESTART_KEY);
+	wr32(TOPRGU_MODE, TOPRGU_MODE_KEY | 0x1u);
+}
+
+static void append_arg_dec(char *line, uint32_t cap, const char *key, uint64_t v)
+{
+	uint32_t n = (uint32_t)strlen(line);
+	char digits[24];
+	int d = 0;
+
+	do {
+		digits[d++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v && d < 24);
+	if (n + strlen(key) + (uint32_t)d + 2 >= cap) {
+		return;
+	}
+	line[n++] = ' ';
+	for (const char *k = key; *k; k++) {
+		line[n++] = *k;
+	}
+	while (d) {
+		line[n++] = digits[--d];
+	}
+	line[n] = 0;
+}
+
 /* ---- starting XNU ---- */
 
 /* ---- how fast the cores are running ---- */
@@ -1963,6 +2338,7 @@ static uint32_t cpu_mhz(void)
 	    ((ticks_after - ticks_before) * 1000000ull));
 }
 
+#if HAKIOS_X6826B
 /* ---- the touch screen, before the kernel wants it ---- */
 
 /*
@@ -2117,6 +2493,8 @@ static void big_cores_clock(void)
 	out(" MHz at the same 800 mV\n");
 }
 
+#endif /* HAKIOS_X6826B */
+
 static void __attribute__((noreturn)) run_xnu(void)
 {
 	struct payload_info pi;
@@ -2125,6 +2503,11 @@ static void __attribute__((noreturn)) run_xnu(void)
 	if (!parse_payload(&pi)) {
 		out("ERROR: no XNU payload in this image\n");
 		dbg_delay_ms(5000);
+		chain_android();
+	}
+	if (!board_ok) {
+		out("ERROR: XNU's memory or our scratch is not known to be free (see above): Android\n");
+		dbg_delay_ms(10000);
 		chain_android();
 	}
 	out("XNU kernel ");
@@ -2277,6 +2660,13 @@ static void __attribute__((noreturn)) run_xnu(void)
 	}
 	/* and the big one off the flash, if it is there (with XNU_ROOT_EMMC the kernel reads it itself) */
 	uint64_t sys_size = XNU_ROOT_EMMC ? 0 : load_system_image();
+	if (XNU_ROOT_EMMC && system_find()) {          /* the kernel reads it; said here, and its LU passed on */
+		out(SYSTEM_PART " on LU ");
+		out_dec(ufs.lun);
+		out(" at block ");
+		out_hex(ufs.part_lba);
+		out("\n");
+	}
 	uint64_t sys_pa = sys_size ? SYSTEM_PA : 0;
 	uint64_t sys_span = (sys_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
 
@@ -2303,6 +2693,11 @@ static void __attribute__((noreturn)) run_xnu(void)
 	ba->video.v_height = PANEL_H;
 	ba->video.v_depth = 32;
 	memcpy(ba->commandLine, XNU_BOOT_ARGS, sizeof(XNU_BOOT_ARGS));
+	/* the kernel's UFS driver uses the same window after us, and the LU found here (bsd/dev/redwood_ufs.c) */
+	append_arg_dec(ba->commandLine, sizeof(ba->commandLine), "ufs_dma=", UFS_DMA_PA);
+	if (ufs.part_blocks) {
+		append_arg_dec(ba->commandLine, sizeof(ba->commandLine), "ufs_lun=", ufs.lun);
+	}
 
 	out("md0 ");
 	out_hex(sys_size ? sys_pa : rd_pa);
@@ -2311,7 +2706,9 @@ static void __attribute__((noreturn)) run_xnu(void)
 	if (sys_size) {
 		out_hex(rd_pa);
 	}
-	out("\nboot-args: " XNU_BOOT_ARGS "\nframebuffer ");
+	out("\nboot-args: ");
+	out(ba->commandLine);
+	out("\nframebuffer ");
 	out_hex(fb_base);
 	out(" pitch ");
 	out_dec(fb_pitch);
@@ -2380,8 +2777,10 @@ static void __attribute__((noreturn)) run_xnu(void)
 	 * place to do it from: it would have to carry those hundred kilobytes itself, and it comes
 	 * up long after the chip has forgotten them.
 	 */
+#if HAKIOS_X6826B
 	touch_bring_up();
 	big_cores_clock();
+#endif
 	/*
 	 * Nothing of ours is left on the panel: iOS paints only what it draws, and where it does not
 	 * reach, what LK wrote there stays -- its "Orange State: your device has been unlocked"
@@ -3366,12 +3765,15 @@ rails_off:
 
 void mtkloader_main(uint64_t dtb)
 {
-	uint32_t mark = marker_get();
-
 	wdt_disable();
 	lk_dtb = dtb;
+	board_read(dtb);
+	board_apply();
 	display_find();
-	fbcon_init(fb_base, fb_pitch, 0, 1);
+	fbcon_init(fb_base, fb_pitch, 0, PANEL_W >= 1080 ? 2 : 1);
+	board_check();
+
+	uint32_t mark = marker_get();
 
 	if (mark == MARK_DONE) {
 		/* XNU's log was saved when it came back; leave ramoops as it is. */
@@ -3384,6 +3786,20 @@ void mtkloader_main(uint64_t dtb)
 	}
 
 	plog_reset();
+#if BOARD_PROBE
+	fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
+	fbc.x = 0;
+	fbc.y = fbc.top = 0;
+	out("== mtkloader: board probe (reads only) ==\n");
+	probe_guard(30);
+	board_report(1);
+	board_check();
+	board_probe_ufs();
+	probe_guard(0);
+	out("== end of probe: Android in 60 s ==\n");
+	dbg_delay_ms(60000);
+	chain_android();
+#endif
 #if TOUCH_PROBE
 	fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
 	fbc.x = 0;
@@ -3421,11 +3837,10 @@ void mtkloader_main(uint64_t dtb)
 	fbc.x = 0;
 	fbc.y = fbc.top = 0;
 	fbc.fg = 0xff40ff40u;
-	out("== mtkloader: Darwin/XNU on X6826B (MT6768) ==\n");
+	out("== mtkloader: Darwin/XNU on X6885 (MT6789) ==\n");
 	fbc.fg = 0xffffffffu;
-	out("LK dtb ");
-	out_hex(dtb);
-	out("\n");
+	board_report(0);
+	board_check();
 	connsys_dt_report(dtb);         /* Wi-Fi step 1: what Android's tree says of CONNSYS (mtkconnsys.h) */
 	run_xnu();
 }

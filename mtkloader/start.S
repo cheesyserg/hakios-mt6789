@@ -33,6 +33,53 @@ primary_entry:
     msr     daifset, #0xf
     mov     x19, x0
 
+    /*
+     * Where LK put us (x20) against where we were linked to run (x21). The Hot 20's LK entered at
+     * 0x40080000, the link address; the Hot 60 Pro's (boot image v4, GKI: kernel_offset 0x8000 on a
+     * base of 0x3fff8000) enters at 0x40000000. Everything after this point uses absolute addresses,
+     * so the whole image -- this program, Android's Image, the XNU payload: image_size bytes, as
+     * tools/chainboot.py wrote it -- is moved to the link address first, as memmove would (the two
+     * ranges overlap). If LK's device tree lies where the image would go, nothing is moved and the
+     * core waits here: LK's watchdog resets the phone (chainboot.py refuses images that big).
+     */
+    adr     x20, _start
+    ldr     x21, =_start
+    cmp     x20, x21
+    b.eq    45f
+    ldr     x22, [x20, #16]             /* image_size */
+    add     x22, x22, #7
+    and     x22, x22, #~7
+    cmp     x19, x21
+    b.lo    40f
+    add     x3, x21, x22
+    cmp     x19, x3
+    b.lo    49f
+40: cmp     x21, x20
+    b.hi    42f
+    mov     x0, x20                     /* down: front to back */
+    mov     x1, x21
+    mov     x2, x22
+41: ldr     x3, [x0], #8
+    str     x3, [x1], #8
+    subs    x2, x2, #8
+    b.hi    41b
+    b       44f
+42: add     x0, x20, x22                /* up: back to front */
+    add     x1, x21, x22
+    mov     x2, x22
+43: ldr     x3, [x0, #-8]!
+    str     x3, [x1, #-8]!
+    subs    x2, x2, #8
+    b.hi    43b
+44: dsb     sy
+    ic      iallu
+    dsb     sy
+    isb
+    ldr     x0, =45f
+    br      x0
+49: wfe
+    b       49b
+45:
     mrs     x1, CurrentEL
     lsr     x1, x1, #2
     adrp    x2, mtk_vectors
@@ -54,6 +101,8 @@ primary_entry:
     str     xzr, [x0], #8
     b       1b
 2:
+    ldr     x0, =lk_entry_pa            /* where LK entered: Android's Image goes back there */
+    str     x20, [x0]
     mov     x0, x19
     bl      mtkloader_main
 3:  wfe
@@ -86,15 +135,24 @@ jump_to_kernel:
     br      x16
 
 /*
- * chain_stub(dtb, dst, src, len, entry): copy Android's Image down over this program and enter
- * it as LK would have. C copies the stub out of the way first. Position independent.
+ * chain_stub(dtb, dst, src, len, entry): copy Android's Image to where LK entered this program
+ * (memmove: down or up) and enter it as LK would have. C copies the stub out of the way first. Position independent.
  */
 chain_stub:
-1:  ldr     x6, [x2], #8
+    cmp     x1, x2
+    b.hi    2f
+1:  ldr     x6, [x2], #8                /* down (or in place): front to back */
     str     x6, [x1], #8
     subs    x3, x3, #8
     b.hi    1b
-    dsb     sy
+    b       3f
+2:  add     x1, x1, x3                  /* up, over its own source: back to front */
+    add     x2, x2, x3
+4:  ldr     x6, [x2, #-8]!
+    str     x6, [x1, #-8]!
+    subs    x3, x3, #8
+    b.hi    4b
+3:  dsb     sy
     ic      iallu
     dsb     sy
     isb
